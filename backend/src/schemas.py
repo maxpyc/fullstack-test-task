@@ -1,34 +1,38 @@
 from datetime import datetime
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
-class FileItem(BaseModel):
+class FileBase(BaseModel):
+    title: str = Field(..., max_length=255)
+
+
+class FileUpdate(FileBase):
+    pass
+
+
+class FileItem(FileBase):
     model_config = ConfigDict(from_attributes=True)
 
-    id: str
-    title: str
+    id: UUID
     original_name: str
     mime_type: str
     size: int
     processing_status: str
-    scan_status: str | None
-    scan_details: str | None
-    metadata_json: dict | None
+    scan_status: str | None = None
+    scan_details: str | None = None
+    metadata_json: dict | None = None
     requires_attention: bool
     created_at: datetime
     updated_at: datetime
-
-
-class FileUpdate(BaseModel):
-    title: str
 
 
 class AlertItem(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
-    file_id: str
+    file_id: UUID
     level: str
     message: str
     created_at: datetime
