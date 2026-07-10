@@ -1,31 +1,47 @@
 import asyncio
-import os
+import uuid
 from pathlib import Path
+
 from celery import Celery
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
-from src.models import Alert, StoredFile
-from src.service import STORAGE_DIR, DB_URL
+from celery.signals import worker_process_init
 
-REDIS_URL = os.environ.get("REDIS_URL", "redis://backend-redis:6379/0")
-_worker_loop: asyncio.AbstractEventLoop | None = None
+from src.config import settings
+from src.database import async_session_maker, engine
+from src.models import Alert
+from src.repository import AlertRepository, FileRepository
 
+celery_app = Celery(
+    "file_tasks",
+    broker=settings.celery_broker_url,
+    backend=settings.celery_broker_url,
+)
 
-def run_in_worker_loop(coroutine):
-    global _worker_loop
-    if _worker_loop is None or _worker_loop.is_closed():
-        _worker_loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(_worker_loop)
-    return _worker_loop.run_until_complete(coroutine)
-
-
-celery_app = Celery("file_tasks", broker=REDIS_URL, backend=REDIS_URL)
-engine = create_async_engine(DB_URL)
-async_session_maker = async_sessionmaker(engine, expire_on_commit=False)
+_loop: asyncio.AbstractEventLoop | None = None
 
 
-async def _scan_file_for_threats(file_id: str) -> None:
+def run_async(coro):
+    global _loop
+    if _loop is None or _loop.is_closed():
+        _loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(_loop)
+    return _loop.run_until_complete(coro)
+
+
+@worker_process_init.connect
+def bootstrap_worker_db_pool(*args, **kwargs) -> None:
+    """Сбрасываем пул при форке процесса воркера."""
+    try:
+        engine.sync_engine.dispose()
+    except Exception as e:
+        print(f"[Celery Worker Init] Safe pool dispose skipped: {e}")
+
+
+async def _scan_file_for_threats(file_id_str: str) -> None:
+    file_id = uuid.UUID(file_id_str)
+
     async with async_session_maker() as session:
-        file_item = await session.get(StoredFile, file_id)
+        repo = FileRepository(session)
+        file_item = await repo.get_by_id(file_id)
         if not file_item:
             return
 
@@ -39,30 +55,36 @@ async def _scan_file_for_threats(file_id: str) -> None:
         if file_item.size > 10 * 1024 * 1024:
             reasons.append("file is larger than 10 MB")
 
-        if extension == ".pdf" and file_item.mime_type not in {"application/pdf", "application/octet-stream"}:
+        if extension == ".pdf" and file_item.mime_type not in {
+            "application/pdf",
+            "application/octet-stream",
+        }:
             reasons.append("pdf extension does not match mime type")
 
         file_item.scan_status = "suspicious" if reasons else "clean"
         file_item.scan_details = ", ".join(reasons) if reasons else "no threats found"
         file_item.requires_attention = bool(reasons)
-        await session.commit()
+        await repo.commit_changes()
 
-    extract_file_metadata.delay(file_id)
+    extract_file_metadata.delay(file_id_str)
 
 
-async def _extract_file_metadata(file_id: str) -> None:
+async def _extract_file_metadata(file_id_str: str) -> None:
+    file_id = uuid.UUID(file_id_str)
+
     async with async_session_maker() as session:
-        file_item = await session.get(StoredFile, file_id)
+        repo = FileRepository(session)
+        file_item = await repo.get_by_id(file_id)
         if not file_item:
             return
 
-        stored_path = STORAGE_DIR / file_item.stored_name
+        stored_path = settings.storage_dir / file_item.stored_name
         if not stored_path.exists():
             file_item.processing_status = "failed"
             file_item.scan_status = file_item.scan_status or "failed"
             file_item.scan_details = "stored file not found during metadata extraction"
-            await session.commit()
-            send_file_alert.delay(file_id)
+            await repo.commit_changes()
+            send_file_alert.delay(file_id_str)
             return
 
         metadata = {
@@ -72,51 +94,69 @@ async def _extract_file_metadata(file_id: str) -> None:
         }
 
         if file_item.mime_type.startswith("text/"):
-            content = stored_path.read_text(encoding="utf-8", errors="ignore")
-            metadata["line_count"] = len(content.splitlines())
-            metadata["char_count"] = len(content)
+            line_count = 0
+            char_count = 0
+            with stored_path.open("r", encoding="utf-8", errors="ignore") as f:
+                for line in f:
+                    line_count += 1
+                    char_count += len(line)
+            metadata["line_count"] = line_count
+            metadata["char_count"] = char_count
+
         elif file_item.mime_type == "application/pdf":
-            content = stored_path.read_bytes()
-            metadata["approx_page_count"] = max(content.count(b"/Type /Page"), 1)
+            target = b"/Type /Page"
+            overlap = len(target) - 1
+            page_count = 0
+            buffer = b""
+
+            with stored_path.open("rb") as f:
+                while chunk := f.read(1024 * 1024):
+                    buffer += chunk
+                    page_count += buffer.count(target)
+                    if len(buffer) >= overlap:
+                        buffer = buffer[-overlap:]
+
+            metadata["approx_page_count"] = max(page_count, 1)
 
         file_item.metadata_json = metadata
         file_item.processing_status = "processed"
-        await session.commit()
+        await repo.commit_changes()
 
-    send_file_alert.delay(file_id)
+    send_file_alert.delay(file_id_str)
 
 
-async def _send_file_alert(file_id: str) -> None:
+async def _send_file_alert(file_id_str: str) -> None:
+    file_id = uuid.UUID(file_id_str)
+
     async with async_session_maker() as session:
-        file_item = await session.get(StoredFile, file_id)
+        file_repo = FileRepository(session)
+        alert_repo = AlertRepository(session)
+
+        file_item = await file_repo.get_by_id(file_id)
         if not file_item:
             return
 
         if file_item.processing_status == "failed":
-            alert = Alert(file_id=file_id, level="critical", message="File processing failed")
+            level, message = "critical", "File processing failed"
         elif file_item.requires_attention:
-            alert = Alert(
-                file_id=file_id,
-                level="warning",
-                message=f"File requires attention: {file_item.scan_details}",
-            )
+            level, message = "warning", f"File requires attention: {file_item.scan_details}"
         else:
-            alert = Alert(file_id=file_id, level="info", message="File processed successfully")
+            level, message = "info", "File processed successfully"
 
-        session.add(alert)
-        await session.commit()
+        alert = Alert(file_id=file_id, level=level, message=message)
+        await alert_repo.add(alert)
 
 
 @celery_app.task
 def scan_file_for_threats(file_id: str) -> None:
-    run_in_worker_loop(_scan_file_for_threats(file_id))
+    run_async(_scan_file_for_threats(file_id))
 
 
 @celery_app.task
 def extract_file_metadata(file_id: str) -> None:
-    run_in_worker_loop(_extract_file_metadata(file_id))
+    run_async(_extract_file_metadata(file_id))
 
 
 @celery_app.task
 def send_file_alert(file_id: str) -> None:
-    run_in_worker_loop(_send_file_alert(file_id))
+    run_async(_send_file_alert(file_id))
