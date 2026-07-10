@@ -1,6 +1,7 @@
+import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, func, Uuid
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -11,7 +12,7 @@ class Base(DeclarativeBase):
 class StoredFile(Base):
     __tablename__ = "files"
 
-    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True)
     title: Mapped[str] = mapped_column(String(255), nullable=False)
     original_name: Mapped[str] = mapped_column(String(255), nullable=False)
     stored_name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
@@ -39,7 +40,7 @@ class Alert(Base):
     __tablename__ = "alerts"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    file_id: Mapped[str] = mapped_column(String(36), ForeignKey("files.id"), nullable=False)
+    file_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("files.id"), nullable=False)
     level: Mapped[str] = mapped_column(String(50), nullable=False)
     message: Mapped[str] = mapped_column(String(500), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
